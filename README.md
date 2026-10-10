@@ -189,3 +189,6 @@ Optional env vars: `ASTROMETRY_API_URL`, `POLL_INTERVAL_SECONDS` (default 3),
 - **Astrometry.net login failed:** double-check the API key.
 - **Android build errors about SDK or Java:** check that `ANDROID_HOME` points to your SDK
   folder and `java -version` shows 17.
+
+  # AI Warning
+  The back end API, story-telling, and docs were facilitated with the use of Claude, Anthropic's AI agent. Like many other AIs, Claude can be wrong. If there is an issue, please do not hesitate to open an issue.
