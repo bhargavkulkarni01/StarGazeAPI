@@ -1,6 +1,6 @@
 # Star Story
 
-Photo of the night sky → Astrometry.net plate solve → constellation → mythological story from Claude Haiku 4.5 (`claude-haiku-4-5-20251001`).
+Photo of the night sky → Astrometry.net plate solve → constellation → mythological story from Claude Haiku 5.5 (`claude-haiku-5-5`).
 
 - `backend/` FastAPI server (Astrometry.net API + astropy + Anthropic SDK)
 - `App.source.tsx` the app code (TypeScript), copied over `mobile/App.tsx` after you create the React Native project

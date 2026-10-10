@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import re
 import threading
@@ -7,6 +8,7 @@ import time
 import uuid
 
 import anthropic
+from photocache import PhotoCache
 import requests
 from astropy.coordinates import SkyCoord, get_constellation
 from dotenv import load_dotenv
@@ -14,9 +16,11 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 
-from services.ai_services import get_story
+from services.ai_services import AnthropicAI
 
 load_dotenv()
+
+log = logging.getLogger(__name__)
 
 ASTROMETRY_URL = os.getenv("ASTROMETRY_API_URL", "https://nova.astrometry.net/api").rstrip("/")
 ASTROMETRY_KEY = os.getenv("ASTROMETRY_API_KEY")
@@ -29,6 +33,9 @@ JOB_TTL = 3600          # keep finished jobs in memory for 1 hour
 
 app = FastAPI(title="Star Story API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+ai = AnthropicAI()
+pc = PhotoCache()
+STORY_FALLBACK = "The stars are quiet tonight... try again in a moment."
 
 # In-memory job store: job_id -> {"status", "stage", "result", "error", "created"}
 JOBS: dict[str, dict] = {}
@@ -124,7 +131,7 @@ def update(job_id: str, **fields):
         JOBS[job_id].update(fields)
 
 
-def run_job(job_id: str, jpeg: bytes, size: tuple[int, int], fov: float | None):
+def run_job(job_id: str, jpeg: bytes, size: tuple[int, int], fov: float | None, cache_key: str):
     try:
         set_stage = lambda s: update(job_id, stage=s)
 
@@ -164,19 +171,24 @@ def run_job(job_id: str, jpeg: bytes, size: tuple[int, int], fov: float | None):
         set_stage("Writing the myth…")
         named = [s["name"] for s in stars if s["proper"]][:10]
         try:
-            story = get_story(constellation, named)
-        except Exception as e:
-            story = f"(Could not generate story: {e})"
+            story = ai.get_story(constellation, named)
+        except Exception:
+            log.exception("Story generation crashed")
+            story = None
+        story_ok = bool(story)
 
-        update(job_id, status="success", stage="Done", result={
+        result = {
             "location": {"ra": ra, "dec": dec, "roll": float(cal["orientation"]), "fov": fov_deg},
             "constellation": constellation,
             "image_size": {"width": width, "height": height},
             "stars": stars,
             "objects_in_field": objects,
-            "story": story,
+            "story": story or STORY_FALLBACK,
             "astrometry_job_id": job,
-        })
+        }
+        update(job_id, status="success", stage="Done", result=result)
+        if story_ok:  # don't cache the fallback, so the next upload retries the story
+            pc.set(cache_key, result)
     except SolveError as e:
         update(job_id, status="failed", error=str(e))
     except requests.RequestException as e:
@@ -194,23 +206,32 @@ def analyze(
 ):
     if not ASTROMETRY_KEY:
         raise HTTPException(503, "ASTROMETRY_API_KEY is not set on the server.")
-    try:
-        img = Image.open(io.BytesIO(image.file.read()))
-        img = ImageOps.exif_transpose(img).convert("RGB")
-        img.thumbnail((MAX_DIM, MAX_DIM))
-        buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=90)
-    except Exception:
-        raise HTTPException(400, "Could not read the uploaded image.")
+    raw = image.file.read()
+    cache_key = PhotoCache.key(raw)
+    cached = pc.get(cache_key)
+
+    if cached is None:
+        try:
+            img = Image.open(io.BytesIO(raw))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            img.thumbnail((MAX_DIM, MAX_DIM))
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=90)
+        except Exception:
+            raise HTTPException(400, "Could not read the uploaded image.")
 
     job_id = uuid.uuid4().hex
     now = time.time()
     with LOCK:
         for k in [k for k, v in JOBS.items() if now - v["created"] > JOB_TTL]:
             del JOBS[k]
-        JOBS[job_id] = {"status": "processing", "stage": "Queued…", "created": now}
+        if cached is not None:  # same photo seen before: finish immediately
+            JOBS[job_id] = {"status": "success", "stage": "Done", "result": cached, "created": now}
+        else:
+            JOBS[job_id] = {"status": "processing", "stage": "Queued…", "created": now}
 
-    background.add_task(run_job, job_id, buf.getvalue(), img.size, fov)
+    if cached is None:
+        background.add_task(run_job, job_id, buf.getvalue(), img.size, fov, cache_key)
     return {"job_id": job_id}
 
 
@@ -223,3 +244,11 @@ def analyze_status(job_id: str):
         if not job:
             raise HTTPException(404, "Unknown or expired job_id.")
         return {k: v for k, v in job.items() if k != "created"}
+
+
+@app.get("/health")
+def health_check():
+    return {
+        "ok": True,
+        "astrometry_key_set": bool(ASTROMETRY_KEY),
+    }
