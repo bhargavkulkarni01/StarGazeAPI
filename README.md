@@ -19,7 +19,7 @@ Get an Astrometry.net key: sign in at https://nova.astrometry.net, open your pro
 ## 1. Backend
 
 ```bash
-cd star-app/backend
+cd backend
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -126,45 +126,21 @@ npx react-native run-android
   `http://192.168.1.20:8000`. iOS also needs an App Transport Security exception for plain
   HTTP, and Android release builds block cleartext HTTP, so use HTTPS there.
 
-## API (asynchronous)
+## API
 
-Solving takes a while (often 30s+), so it is a start-then-poll flow.
+Start a job with `POST /analyze` (photo + optional `fov`), then poll `GET /analyze/<job_id>`
+until `status` is `success` or `failed`. Full reference, response fields, config and limits:
+[backend/API.md](backend/API.md).
 
-**Start a job**
+### Desktop test client
+
+`test/app.py` is a Dear ImGui app with one button per example photo in `test/images/`. It
+uploads the photo, polls the job and shows the JSON responses and the story.
+
 ```bash
-curl -X POST http://localhost:8000/analyze \
-  -F "image=@/full/path/to/night-sky.jpg" \
-  -F "fov=60"
-# {"job_id":"3f2c..."}
+pip install -r test/requirements.txt
+python test/app.py        # backend must be running on http://localhost:8000
 ```
-`fov` is optional: the estimated width of the photo in degrees. It makes solving much faster.
-
-**Poll the job** until `status` is `success` or `failed`
-```bash
-curl -s http://localhost:8000/analyze/<job_id> | jq
-```
-```json
-{"status": "processing", "stage": "Solving star field…"}
-```
-On success:
-```json
-{
-  "status": "success",
-  "stage": "Done",
-  "result": {
-    "location": {"ra": 0, "dec": 0, "roll": 0, "fov": 0},
-    "constellation": "Orion",
-    "image_size": {"width": 0, "height": 0},
-    "stars": [{"name": "Rigel", "names": ["Rigel"], "type": "star", "proper": true, "x": 0, "y": 0}],
-    "objects_in_field": ["..."],
-    "story": "..."
-  }
-}
-```
-On failure: `{"status": "failed", "error": "..."}`. `GET /health` returns server status.
-
-Optional env vars: `ASTROMETRY_API_URL`, `POLL_INTERVAL_SECONDS` (default 3),
-`SOLVE_TIMEOUT_SECONDS` (default 300).
 
 ## Notes
 

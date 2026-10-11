@@ -6,10 +6,12 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
-import anthropic
 from photocache import PhotoCache
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from astropy.coordinates import SkyCoord, get_constellation
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -28,6 +30,7 @@ ASTROMETRY_KEY = os.getenv("ASTROMETRY_API_KEY")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_SECONDS", "3"))
 SOLVE_TIMEOUT = float(os.getenv("SOLVE_TIMEOUT_SECONDS", "300"))
 MAX_DIM = 2000          # downscale big photos before uploading
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # reject bigger uploads before decoding
 MAX_MARKERS = 60        # max annotated objects returned
 JOB_TTL = 3600          # keep finished jobs in memory for 1 hour
 
@@ -45,9 +48,15 @@ LOCK = threading.Lock()
 class SolveError(Exception):
     pass
 
+
+# Shared session: reuses connections and retries transient errors on GETs (default Retry
+# methods exclude POST, so an upload is never submitted twice).
+http = requests.Session()
+http.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])))
+
 # ---------------------------------------------------------------- Astrometry.net
 def nova_login() -> str:
-    r = requests.post(
+    r = http.post(
         f"{ASTROMETRY_URL}/login",
         data={"request-json": json.dumps({"apikey": ASTROMETRY_KEY})},
         timeout=30,
@@ -66,9 +75,9 @@ def nova_upload(session: str, jpeg: bytes, fov: float | None) -> int:
         "allow_commercial_use": "n",
         "allow_modifications": "n",
     }
-    if fov:  # scale hint makes solving much faster: estimated width in degrees, +/-20%
-        req.update(scale_units="degwidth", scale_type="ev", scale_est=fov, scale_err=20)
-    r = requests.post(
+    if fov:  # scale hint speeds solving a lot; wide bounds because a human guess outside them fails the solve
+        req.update(scale_units="degwidth", scale_type="ul", scale_lower=str(fov / 2), scale_upper=str(fov * 2))
+    r = http.post(
         f"{ASTROMETRY_URL}/upload",
         data={"request-json": json.dumps(req)},
         files={"file": ("sky.jpg", jpeg, "image/jpeg")},
@@ -82,9 +91,18 @@ def nova_upload(session: str, jpeg: bytes, fov: float | None) -> int:
 
 
 def nova_get(path: str) -> dict:
-    r = requests.get(f"{ASTROMETRY_URL}/{path}", timeout=30)
+    r = http.get(f"{ASTROMETRY_URL}/{path}", timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+def nova_list(path: str, key: str) -> list:
+    """Optional extras: an empty list instead of failing the whole job."""
+    try:
+        return nova_get(path).get(key, [])
+    except Exception:
+        log.warning("Astrometry.net %s failed", path, exc_info=True)
+        return []
 
 
 def wait_for_job(subid: int, set_stage) -> int:
@@ -142,18 +160,14 @@ def run_job(job_id: str, jpeg: bytes, size: tuple[int, int], fov: float | None, 
         job = wait_for_job(subid, set_stage)
 
         set_stage("Reading results…")
-        cal = nova_get(f"jobs/{job}/calibration")
-        try:
-            annotations = nova_get(f"jobs/{job}/annotations").get("annotations", [])
-        except Exception:
-            annotations = []
-        try:
-            objects = nova_get(f"jobs/{job}/objects_in_field").get("objects_in_field", [])
-        except Exception:
-            objects = []
+        with ThreadPoolExecutor(3) as ex:  # three independent requests, fetch in parallel
+            cal_f = ex.submit(nova_get, f"jobs/{job}/calibration")
+            ann_f = ex.submit(nova_list, f"jobs/{job}/annotations", "annotations")
+            obj_f = ex.submit(nova_list, f"jobs/{job}/objects_in_field", "objects_in_field")
+            cal, annotations, objects = cal_f.result(), ann_f.result(), obj_f.result()
 
         ra, dec = float(cal["ra"]), float(cal["dec"])
-        constellation = get_constellation(SkyCoord(ra=ra, dec=dec, unit="deg"))
+        constellation = str(get_constellation(SkyCoord(ra=ra, dec=dec, unit="deg")))
         width, height = size
         fov_deg = float(cal["pixscale"]) * width / 3600.0  # pixscale is arcsec/pixel
 
@@ -194,6 +208,7 @@ def run_job(job_id: str, jpeg: bytes, size: tuple[int, int], fov: float | None, 
     except requests.RequestException as e:
         update(job_id, status="failed", error=f"Astrometry.net request failed: {e}")
     except Exception as e:  # keep the job record useful instead of crashing the worker
+        log.exception("Job %s crashed", job_id)
         update(job_id, status="failed", error=f"Unexpected error: {e}")
 
 
@@ -202,11 +217,13 @@ def run_job(job_id: str, jpeg: bytes, size: tuple[int, int], fov: float | None, 
 def analyze(
     background: BackgroundTasks,
     image: UploadFile = File(...),
-    fov: float | None = Form(None),  # optional estimated width of the photo in degrees
+    fov: float | None = Form(None, gt=0, le=180),  # optional estimated width of the photo in degrees
 ):
     if not ASTROMETRY_KEY:
         raise HTTPException(503, "ASTROMETRY_API_KEY is not set on the server.")
-    raw = image.file.read()
+    raw = image.file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Image is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
     cache_key = PhotoCache.key(raw)
     cached = pc.get(cache_key)
 
@@ -225,10 +242,14 @@ def analyze(
     with LOCK:
         for k in [k for k, v in JOBS.items() if now - v["created"] > JOB_TTL]:
             del JOBS[k]
+        # same photo already being solved (e.g. a double tap): share that job instead of solving twice
+        for k, v in JOBS.items():
+            if v["status"] == "processing" and v.get("cache_key") == cache_key:
+                return {"job_id": k}
         if cached is not None:  # same photo seen before: finish immediately
             JOBS[job_id] = {"status": "success", "stage": "Done", "result": cached, "created": now}
         else:
-            JOBS[job_id] = {"status": "processing", "stage": "Queued…", "created": now}
+            JOBS[job_id] = {"status": "processing", "stage": "Queued…", "created": now, "cache_key": cache_key}
 
     if cached is None:
         background.add_task(run_job, job_id, buf.getvalue(), img.size, fov, cache_key)
@@ -239,11 +260,9 @@ def analyze(
 def analyze_status(job_id: str):
     with LOCK:
         job = JOBS.get(job_id)
-        print("looking for job: {}", job_id)
-        print("response: {}", job)
         if not job:
             raise HTTPException(404, "Unknown or expired job_id.")
-        return {k: v for k, v in job.items() if k != "created"}
+        return {k: v for k, v in job.items() if k not in ("created", "cache_key")}
 
 
 @app.get("/health")
